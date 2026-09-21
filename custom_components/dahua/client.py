@@ -9,6 +9,7 @@ import time
 import aiohttp
 
 from .digest import DigestAuth
+from .ivs import ivs_rule_index
 from .rpc2 import DahuaRpc2Client, Rpc2MethodRefused
 from hashlib import md5
 from urllib.parse import quote
@@ -263,6 +264,8 @@ _HOST_CACHE: dict = {}
 
 def _cache_lifetime(url: str) -> int:
     """How long this URL's answer stays good for."""
+    if "name=VideoAnalyseRule" in url:
+        return HOST_CACHE_TTL_SECONDS
     return CONFIG_CACHE_TTL_SECONDS if CONFIG_READ_MARKER in url else HOST_CACHE_TTL_SECONDS
 
 
@@ -992,6 +995,16 @@ class DahuaClient:
         table.VideoAnalyseRule[0][1].Name=IVS-1
         """
         return await self.async_get_config("VideoAnalyseRule")
+
+    async def async_set_ivs_rule_by_id(self, channel: int, rule_id: str, enabled: bool):
+        """Resolve the rule just before writing, bypassing the shared read cache."""
+        table = await self._request(
+            "/cgi-bin/configManager.cgi?action=getConfig&name=VideoAnalyseRule"
+        )
+        index = ivs_rule_index(table, channel, rule_id)
+        if index is None:
+            raise ValueError(f"IVS rule {rule_id} is missing or ambiguous on channel {channel}")
+        return await self.async_set_ivs_rule(channel, index, enabled)
 
     async def async_set_all_ivs_rules(self, channel: int, enabled: bool):
         """

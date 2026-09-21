@@ -45,6 +45,9 @@ class _Coordinator:
     def supports_nvr_active_deterrence(self):
         return False
 
+    def get_ivs_rules(self):
+        return []
+
     def get_serial_number(self):
         return "SERIAL1"
 
