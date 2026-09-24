@@ -34,6 +34,94 @@ def hass_brightness_to_dahua_brightness(hass_brightness: int) -> int:
 _LOGGER = logging.getLogger(__name__)
 
 
+def parse_remote_devices(data) -> dict:
+    """Which channels a recorder says it has a camera on.
+
+    RemoteDevice carries one block per slot, keyed by an index inside a
+    uuid-ish name:
+
+        table.RemoteDevice.uuid:System_CONFIG_NETCAMERA_INFO_11.Enable=true
+        table.RemoteDevice.uuid:System_CONFIG_NETCAMERA_INFO_11.ProtocolType=Private
+
+    Returns {index: {"enabled": bool, "protocol": str}}.
+
+    Measured on a DHI-NVR5464-16P-EI: sixteen slots, fifteen enabled, one
+    of those reached over Onvif. The channel number is the index plus one.
+    """
+    if not isinstance(data, dict):
+        return {}
+    found = {}
+    for key, value in data.items():
+        match = re.search(r"INFO_(\d+)\.(\w+)$", str(key))
+        if not match:
+            continue
+        slot = found.setdefault(int(match.group(1)), {})
+        field = match.group(2)
+        if field == "Enable":
+            slot["enabled"] = str(value).strip().lower() == "true"
+        elif field == "ProtocolType":
+            slot["protocol"] = str(value).strip().lower()
+    for slot in found.values():
+        slot.setdefault("enabled", False)
+        slot.setdefault("protocol", "")
+    return found
+
+
+def parse_channel_titles(data) -> dict:
+    """The name a recorder holds for each channel, by index.
+
+        table.ChannelTitle[0].Name=FRONT STREET
+
+    Only useful for labelling. Unconfigured slots carry defaults, and those
+    defaults are not consistent even within one recorder: `Channel11`,
+    `Channel 1`, `Channel16` and `IPC` all appeared on the same device. So a
+    name says nothing about whether a camera is there, and nothing here tries
+    to read anything into it.
+    """
+    if not isinstance(data, dict):
+        return {}
+    titles = {}
+    for key, value in data.items():
+        match = re.search(r"ChannelTitle\[(\d+)\]\.Name$", str(key))
+        if match:
+            titles[int(match.group(1))] = str(value).strip()
+    return titles
+
+
+def channels_worth_offering(devices: dict) -> list:
+    """The channel indexes worth probing, in order.
+
+    A slot that is switched off has no camera. A slot reached over Onvif
+    has one, and this integration cannot drive it: the recorder does not
+    serve such a channel on its own Dahua paths, so snapshot answers 400
+    and RTSP times out (#710). Offering it would add an entry that can
+    never work.
+
+    Being enabled is necessary and not sufficient. A camera removed from
+    the recorder leaves its slot enabled with a stale serial, and only a
+    probe tells the difference, which is why the caller probes.
+    """
+    return sorted(
+        index for index, slot in devices.items()
+        if slot.get("enabled") and slot.get("protocol") != "onvif"
+    )
+
+
+def parse_overlay_lines(value) -> list:
+    """Split a stored overlay value into the lines it was written from.
+
+    Dahua separates the lines of a title with a pipe, which is why the
+    writer escapes the parts and leaves the separator alone. Reading is
+    the same rule backwards.
+
+    An empty value is no lines rather than one empty line, so a camera
+    with nothing set reads back as nothing set.
+    """
+    if not value:
+        return []
+    return str(value).split("|")
+
+
 def parse_event(data: str) -> list[dict[str, any]]:
     # This will turn the event stream data into a list of events, where each item in the list is a dictionary and where
     # the key of the dictionary is the key is for example "Code" and the value is "VideoMotion", etc
@@ -51,24 +139,31 @@ def parse_event(data: str) -> list[dict[str, any]]:
     #   ...
     # }]
 
-    # We will split on "--myboundary" and then skip the first 3 lines so we end up with a string that starts with Code=
+    # We will split on "--myboundary" and then find the line the event starts on
     event_blocks = re.split(r'--myboundary\r?\n', data)
 
     events = []
 
     for event_block in event_blocks:
-        # Skip the first 3 lines... the first line looks like: Content-Type: text/plain
-        s = event_block.split("\n", 3)
-        # Four parts are needed to have a fourth, and a chunk can end
-        # anywhere: stream_events hands on whatever iter_chunks gives it, so a
-        # block that stops after its headers is ordinary, not exceptional. The
-        # guard read "< 3" and then indexed [3], so such a block raised
-        # IndexError out of on_receive and took the whole stream down with it.
-        if len(s) < 4:
+        # Find "Code=" wherever it falls, rather than counting header lines.
+        #
+        # This skipped exactly three lines and required the fourth to be the
+        # event. Most blocks do look like that -- Content-Type, Content-Length,
+        # blank, Code= -- but the header count is the device's choice and not a
+        # rule, and a block carrying one header line fewer was dropped without
+        # a word. @jaaneo reported it in #587 on a DHI-TPC-BF1241, whose thermal
+        # channel does not use the same header shape as its visual one, so those
+        # events never arrived and nothing said why.
+        #
+        # A block that stops inside its headers still carries no event and is
+        # still skipped, which is what a chunk ending mid-block looks like:
+        # stream_events hands on whatever iter_chunks gives it, so that is
+        # ordinary rather than exceptional. Indexing blindly there raised
+        # IndexError out of on_receive and took the whole stream down (#475).
+        start = re.search(r'^Code=', event_block, re.MULTILINE)
+        if start is None:
             continue
-        event_block = s[3].strip()
-        if not event_block.startswith("Code="):
-            continue
+        event_block = event_block[start.start():].strip()
 
         # At this point we'll have something that looks like this...
         # Code=VideoMotion;action=Start;index=0;data={

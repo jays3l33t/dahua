@@ -48,6 +48,9 @@ class _Coordinator:
     def get_ivs_rules(self):
         return []
 
+    def uses_rpc2_deterrence(self, dahua_type=None):
+        return False
+
     def get_serial_number(self):
         return "SERIAL1"
 

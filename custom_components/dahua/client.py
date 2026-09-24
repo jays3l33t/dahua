@@ -1142,6 +1142,30 @@ class DahuaClient:
             holder.keepalive = asyncio.ensure_future(_rpc2_keepalive(holder, interval))
         return holder
 
+    # Direct-camera CoaxialControlIO RPC2 calls use channel 0, matching the
+    # camera WebUI requests. Legacy CGI uses 1-based channel 1 for standalone
+    # cameras; this protocol difference is intentional, not an off-by-one error.
+    async def async_get_coaxial_control_io_caps_rpc2(self) -> dict[str, bool]:
+        """Probe a direct camera on channel zero, independently of config transport."""
+        holder = await self._shared_rpc2()
+        return await holder.client.get_coaxial_control_io_caps(0)
+
+    async def async_get_coaxial_control_io_status_rpc2(self) -> dict:
+        """Read direct-camera deterrence state in the coordinator's CGI shape."""
+        holder = await self._shared_rpc2()
+        status = await holder.client.get_coaxial_control_io_status(0)
+        return {
+            "status.Speaker": "On" if status.speaker else "Off",
+            "status.WhiteLight": "On" if status.white_light else "Off",
+        }
+
+    async def async_set_coaxial_control_state_rpc2(
+        self, dahua_type: int, enabled: bool
+    ) -> dict:
+        """Write direct-camera deterrence on channel zero."""
+        holder = await self._shared_rpc2()
+        return await holder.client.set_coaxial_control_state(0, dahua_type, enabled)
+
     async def _rpc2_get_config(self, name: str) -> dict:
         """A config read over the shared session, in CGI's shape.
 
@@ -1515,6 +1539,24 @@ class DahuaClient:
         )
         return await self.get(url)
 
+    async def async_ptz_move(self, channel: int, code: str, speed: int,
+                             duration: float) -> None:
+        """Move the camera, then stop it.
+
+        ptz.cgi has no notion of moving by an amount: a start begins the
+        motion and it continues until a matching stop, so the duration is
+        how far it goes. That is also why the stop is in a finally. A
+        request that fails after the start would otherwise leave the
+        camera turning until something else stopped it.
+        """
+        base = ("/cgi-bin/ptz.cgi?action={0}&channel={1}&code={2}"
+                "&arg1=0&arg2={3}&arg3=0")
+        await self.get(base.format("start", channel, code, speed))
+        try:
+            await asyncio.sleep(duration)
+        finally:
+            await self.get(base.format("stop", channel, code, speed))
+
     async def async_set_video_profile_mode(self, channel: int, mode: str):
         """
         async_set_video_profile_mode will set camera's profile mode to day or night
@@ -1600,6 +1642,26 @@ class DahuaClient:
         value = await self.get(url)
         if "OK" not in value and "ok" not in value:
             raise Exception("Could not enable/disable customer overlay")
+
+    async def async_get_remote_devices(self) -> dict:
+        """Read the recorder's camera slots.
+
+        Host wide, and only meaningful on a recorder. A standalone camera
+        either has no such table or reports nothing useful, and the caller
+        treats an empty answer as "nothing to offer".
+        """
+        return await self.get(
+            "/cgi-bin/configManager.cgi?action=getConfig&name=RemoteDevice")
+
+    async def async_get_video_widget(self) -> dict:
+        """Read the overlay configuration.
+
+        One table for the whole device, indexed by channel, so the channels
+        of a recorder share this read. It is a getConfig, so the shared
+        cache answers it and a write from here drops that cache.
+        """
+        return await self.get(
+            "/cgi-bin/configManager.cgi?action=getConfig&name=VideoWidget")
 
     async def async_set_service_set_channel_title(self, channel: int, text1: str, text2: str):
         """ async_set_service_set_channel_title sets the channel title """
@@ -1936,7 +1998,9 @@ class DahuaClient:
         StorageFailure: storage failure event.
         StorageLowSpace: storage low space event.
         AlarmOutput: alarm output event.
-        InterVideoAccess: I don't know what this is
+        InterVideoAccess: access to the device's own interface, web logins and
+            logouts among them. The specific action is in Data.Type, for example
+            {"Type": "WebAllLogout"}. Arrives as a Pulse. Reported in #240.
         NTPAdjustTime: NTP time updates?
         TimeChange: Some event for time changes, related to NTPAdjustTime
         MDResult: motion detection data reporting event. The motion detect window contains 18 rows and 22 columns. The event info contains motion detect data with mask of every row.
@@ -2039,6 +2103,15 @@ class DahuaClient:
                 # We didn't get a key=value. We just got a key. Just stick it in the dictionary and move on
                 data_dict[parts[0]] = line
         return data_dict
+
+    @property
+    def device_key(self) -> str:
+        """Which device this is, as opposed to which address answers for it.
+
+        Two devices can sit behind one address on different ports, so anything
+        shared per device keys on this rather than on the address.
+        """
+        return self._device
 
     async def async_probe_snapshot(self, channel_number: int) -> None:
         """Checks the snapshot endpoint answers for a channel, without fetching the image.
@@ -2207,4 +2280,3 @@ class DahuaClient:
             return "Sub"
         else:
             return "Sub_{0}".format(subtype)
-

@@ -665,6 +665,27 @@ ISSUE_HTTP_DEAD_HTTPS_AVAILABLE = "http_dead_https_available_{0}"
 # count must be shared or eight channels of one box raise eight separate cards.
 _HOST_FAILURES: dict = {}
 
+# Whether a device numbers its channels from zero, decided once for the whole
+# device rather than once per config entry.
+#
+# Every entry used to probe this for itself, and the probe is the same URL for
+# all of them -- snapshot.cgi?channel=0. Six entries on one recorder therefore
+# fired six identical requests at setup, through a semaphore two wide, with the
+# timeout covering the wait for a slot as well as the request. On a busy XVR
+# some won and some timed out, and a timeout was read as a definite no:
+#
+#     PROBE_FAILED = (ClientError, TimeoutError)
+#
+# so those entries kept channel + 1 and pointed at the next channel's video
+# while their neighbours pointed at their own. That is #724: channels
+# duplicating, cameras vanishing, and a different arrangement on every
+# restart, because which entry won the race changed each time.
+#
+# Keyed by device rather than address because one address can answer for more
+# than one device, the same reason the digest state is keyed that way.
+_HOST_CHANNEL_BASE: dict = {}
+_HOST_CHANNEL_BASE_LOCKS: dict = {}
+
 
 def normalize_address(address: str) -> str:
     """One device, one key.
@@ -807,6 +828,47 @@ def async_host_is_unreachable(address: str) -> bool:
     """
     state = _HOST_FAILURES.get(normalize_address(address))
     return bool(state and state["consecutive"] >= UNREACHABLE_AFTER_FAILURES)
+
+
+async def async_device_is_zero_indexed(client, device: str):
+    """Whether this device numbers its channels from zero.
+
+    Asked once per device and shared, so the entries do not race each other
+    to the same answer and do not spend six requests arriving at it.
+
+    Returns True, False, or None when the device did not say. None is the
+    point of this function: a timeout or a dropped connection is not the
+    device telling us it is one-indexed, it is the device not answering, and
+    treating those alike is what renumbered a working channel.
+
+    Only an HTTP status counts as a no. That is the device answering.
+    """
+    if device in _HOST_CHANNEL_BASE:
+        return _HOST_CHANNEL_BASE[device]
+
+    lock = _HOST_CHANNEL_BASE_LOCKS.get(device)
+    if lock is None:
+        lock = _HOST_CHANNEL_BASE_LOCKS[device] = asyncio.Lock()
+
+    async with lock:
+        # Another entry may have settled it while this one waited.
+        if device in _HOST_CHANNEL_BASE:
+            return _HOST_CHANNEL_BASE[device]
+        try:
+            await client.async_probe_snapshot(0)
+            _HOST_CHANNEL_BASE[device] = True
+        except ClientResponseError:
+            # The device answered, and the answer was no.
+            _HOST_CHANNEL_BASE[device] = False
+        except (ClientError, TimeoutError, asyncio.TimeoutError):
+            # It did not answer. Decide nothing and leave it for the next
+            # entry or the next restart, rather than caching a guess that
+            # every other channel would then inherit.
+            _LOGGER.debug(
+                "%s did not answer the channel numbering probe; leaving it undecided",
+                device, exc_info=True)
+            return None
+    return _HOST_CHANNEL_BASE[device]
 
 
 @callback
@@ -1148,6 +1210,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         self.connected = None
         self.events: list = events
         self._supports_coaxial_control = False
+        self._supports_rpc2_siren = False
+        self._supports_rpc2_security_light = False
         self._alarm_output_slots = 0
         self._nvr_active_deterrence = entry.options.get(CONF_NVR_ACTIVE_DETERRENCE, False)
         self._supports_disarming_linkage = False
@@ -1157,6 +1221,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         self._supports_ptz_position = False
         self._supports_lighting = False
         self._supports_day_night_color = False
+        # What the device said when a probe failed, keyed by probe name.
+        self._probe_refusals: Dict[str, dict] = {}
         self._channel_model = None
         self._supports_privacy_mode = False
         self._supports_floodlightmode = False
@@ -1339,6 +1405,36 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """
         return any(self.config_entry.options.get(platform, True) for platform in platforms)
 
+    def _note_probe_refusal(self, name: str, exception) -> None:
+        """Remember what the device said when a capability probe failed.
+
+        An HTTP status is the device answering, and a 400 for a config table
+        is it saying it does not serve that table. That is a fact about the
+        model and it generalises. A timeout or a dropped connection is the
+        device not answering, which is a fact about that moment and
+        generalises to nothing.
+
+        Both used to end at `self._supports_x = False`, which records that
+        the feature is off and throws away which of the two it was. Every
+        capability is remembered and every refusal is discarded, and the
+        refusal is the half that says what a model will not do. Not having
+        that, per model, is what the model-name matching in #570, #676 and
+        #690 exists to work around.
+        """
+        status = getattr(exception, "status", None)
+        # Self-initialising, because a probe must never be the thing that
+        # raises. Coordinators are built with object.__new__ in a dozen
+        # tests, which skips __init__, and a capability probe is exactly
+        # the wrong place to start depending on that having run.
+        refusals = getattr(self, "_probe_refusals", None)
+        if refusals is None:
+            refusals = self._probe_refusals = {}
+        refusals[name] = {
+            "answered": status is not None,
+            "status": status,
+            "error": type(exception).__name__,
+        }
+
     def _auth_refused(self, exception) -> Exception:
         """What to raise when the device refuses these credentials.
 
@@ -1424,22 +1520,25 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 # on channel=1) can disable it via the integration options.
                 auto_detect = self.config_entry.options.get(CONF_AUTO_DETECT_CHANNEL, True)
                 if auto_detect:
-                    try:
-                        await self.client.async_probe_snapshot(0)
-                        # If able to take a snapshot with index 0 then most likely this cams channel needs to be reset
-                        # but check if unit is not a doorbell first as channel 0 doesnt exist for VTOs
-                        if not self.is_doorbell():
-                            self._channel_number = self._channel
-                    except PROBE_FAILED:
-                        pass
+                    # Asked once for the device and shared, and a device that does
+                    # not answer leaves this alone rather than renumbering the
+                    # channel behind the user's back (#724).
+                    zero_indexed = await async_device_is_zero_indexed(
+                        self.client, self.client.device_key)
+                    # A doorbell is excluded because channel 0 does not exist on a VTO.
+                    if zero_indexed and not self.is_doorbell():
+                        self._channel_number = self._channel
                 _LOGGER.debug("Using channel number %s (auto_detect=%s)", self._channel_number, auto_detect)
 
-                try:
-                    coaxial_channel = self._channel_number if self.is_nvr_channel() else 1
-                    await self.client.async_get_coaxial_control_io_status(coaxial_channel)
-                    self._supports_coaxial_control = True
-                except PROBE_REFUSED:
-                    self._supports_coaxial_control = False
+                await self._async_probe_direct_deterrence()
+                if not self.uses_rpc2_deterrence():
+                    try:
+                        coaxial_channel = self._channel_number if self.is_nvr_channel() else 1
+                        await self.client.async_get_coaxial_control_io_status(coaxial_channel)
+                        self._supports_coaxial_control = True
+                    except PROBE_REFUSED as probe_error:
+                        self._note_probe_refusal("coaxial_control", probe_error)
+                        self._supports_coaxial_control = False
                 _LOGGER.debug("Device supports Coaxial Control=%s", self._supports_coaxial_control)
 
                 try:
@@ -1448,7 +1547,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                         self._alarm_output_slots = max(0, int(alarm_output_data.get("result", "0")))
                     except (ValueError, TypeError):
                         self._alarm_output_slots = 0
-                except PROBE_FAILED:
+                except PROBE_FAILED as probe_error:
+                    self._note_probe_refusal("alarm_output", probe_error)
                     self._alarm_output_slots = 0
                 _LOGGER.debug("Device alarm output slots=%s", self._alarm_output_slots)
                 if self._alarm_output_slots > 1:
@@ -1461,14 +1561,16 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 try:
                     await self.client.async_get_disarming_linkage()
                     self._supports_disarming_linkage = True
-                except PROBE_FAILED:
+                except PROBE_FAILED as probe_error:
+                    self._note_probe_refusal("disarming_linkage", probe_error)
                     self._supports_disarming_linkage = False
                 _LOGGER.debug("Device supports disarming linkage=%s", self._supports_disarming_linkage)
 
                 try:
                     await self.client.async_get_event_notifications()
                     self._supports_event_notifications = True
-                except PROBE_FAILED:
+                except PROBE_FAILED as probe_error:
+                    self._note_probe_refusal("event_notifications", probe_error)
                     self._supports_event_notifications = False
                 _LOGGER.debug("Device supports event notifications=%s", self._supports_event_notifications)
 
@@ -1481,7 +1583,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                     try:
                         await self.client.async_get_ptz_position()
                         self._supports_ptz_position = True
-                    except PROBE_FAILED:
+                    except PROBE_FAILED as probe_error:
+                        self._note_probe_refusal("ptz_position", probe_error)
                         self._supports_ptz_position = False
                 _LOGGER.debug("Device supports PTZ position=%s", self._supports_ptz_position)
 
@@ -1492,7 +1595,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                     table = await self.client.async_get_smart_motion_detection()
                     self._supports_smart_motion_detection = True
                     smart_motion_rows = smart_motion_row_indices(table)
-                except PROBE_FAILED:
+                except PROBE_FAILED as probe_error:
+                    self._note_probe_refusal("smart_motion_detect", probe_error)
                     self._supports_smart_motion_detection = False
                 _LOGGER.debug("Device supports smart motion detection=%s", self._supports_smart_motion_detection)
 
@@ -1512,7 +1616,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                     options = await self.client.async_get_video_in_options()
                     self._supports_day_night_color = (
                         day_night_color_name(options, self._channel) is not None)
-                except PROBE_FAILED:
+                except PROBE_FAILED as probe_error:
+                    self._note_probe_refusal("day_night_color", probe_error)
                     self._supports_day_night_color = False
                 _LOGGER.debug("Device supports day/night mode=%s", self._supports_day_night_color)
 
@@ -1539,7 +1644,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                             "Assistant's own ONVIF integration, pointed at the recorder "
                             "rather than at the camera, does serve it (#646).",
                             self._channel, self._address)
-                except PROBE_FAILED:
+                except PROBE_FAILED as probe_error:
+                    self._note_probe_refusal("channel_model", probe_error)
                     self._channel_model = None
                 if self._channel_model:
                     _LOGGER.debug(
@@ -1573,7 +1679,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 try:
                     await self.client.async_get_lighting_v2()
                     self._supports_lighting_v2 = True
-                except PROBE_FAILED:
+                except PROBE_FAILED as probe_error:
+                    self._note_probe_refusal("lighting_v2", probe_error)
                     self._supports_lighting_v2 = False
                     pass
                 _LOGGER.debug("Device supports Lighting_V2=%s", self._supports_lighting_v2)
@@ -1619,7 +1726,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                         # Error: Error -1 getting param in name=Lighting[0][1]
                         # Otherwise we'll get multiple lines of config back
                         self._supports_profile_mode = len(conf) > 1
-                    except PROBE_FAILED:
+                    except PROBE_FAILED as probe_error:
+                        self._note_probe_refusal("profile_mode", probe_error)
                         _LOGGER.debug("Cam does not support profile mode. Will use mode 0")
                         self._supports_profile_mode = False
                     _LOGGER.debug("Device supports profile mode=%s", self._supports_profile_mode)
@@ -1689,7 +1797,11 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             if self.supports_alarm_output() and self._wanted_by(SWITCH):
                 coros.append(asyncio.ensure_future(self.client.async_get_alarm_output_state()))
             # The siren switch and the security light both read this one.
-            if self._supports_coaxial_control and self._wanted_by(LIGHT, SWITCH):
+            if self.uses_rpc2_deterrence() and self._wanted_by(LIGHT, SWITCH):
+                coros.append(asyncio.ensure_future(
+                    self.client.async_get_coaxial_control_io_status_rpc2()
+                ))
+            elif self._supports_coaxial_control and self._wanted_by(LIGHT, SWITCH):
                 coaxial_channel = self._channel_number if self.is_nvr_channel() else 1
                 coros.append(
                     asyncio.ensure_future(
@@ -1737,7 +1849,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             # Only if it was not already fetched above: on a camera that both
             # supports the v2 API and reports a security light, this was being
             # requested twice on every poll.
-            if ((self.supports_security_light() or self.is_flood_light())
+            if (((self.supports_security_light() and not self.uses_rpc2_deterrence(1))
+                    or self.is_flood_light())
                     and not self._supports_lighting_v2 and self._wanted_by(LIGHT)):
                 light_v2 = await self.client.async_get_lighting_v2()
                 if light_v2 is not None:
@@ -2066,13 +2179,40 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """
         return self._supports_profile_mode
 
+    async def _async_probe_direct_deterrence(self) -> None:
+        """Cache explicit capabilities once during direct-camera setup."""
+        self._supports_rpc2_siren = False
+        self._supports_rpc2_security_light = False
+        if self.is_nvr_channel():
+            return
+        try:
+            caps = await self.client.async_get_coaxial_control_io_caps_rpc2()
+            self._supports_rpc2_siren = caps.get("SupportControlSpeaker") is True
+            self._supports_rpc2_security_light = caps.get("SupportControlLight") is True
+        except Exception:  # Optional RPC2 support must not prevent legacy setup.
+            _LOGGER.debug("Direct-camera RPC2 deterrence probe failed; using model fallback", exc_info=True)
+
+    def uses_rpc2_deterrence(self, dahua_type: int | None = None) -> bool:
+        """Select RPC2 independently for each explicitly supported output."""
+        speaker = getattr(self, "_supports_rpc2_siren", False)
+        light = getattr(self, "_supports_rpc2_security_light", False)
+        if not (speaker or light) or self.is_nvr_channel():
+            return False
+        return {1: light, 2: speaker}.get(dahua_type, speaker or light)
+
     def supports_siren(self) -> bool:
         """
         Returns true if this camera has a siren. For example, the IPC-HDW3849HP-AS-PV does
         https://dahuawiki.com/Template:NameConvention
         """
         m = self.model.upper()
-        return "-AS-PV" in m or "L46N" in m or m.startswith("W452ASD")
+        return (self.uses_rpc2_deterrence(2)
+                or "-AS-PV" in m or "L46N" in m or m.startswith("W452ASD")
+                # TPC-BF1241-TB3F4-DW-S8-HW reports SupportControlSpeaker=0
+                # via getCaps, but its built-in siren is present and controllable.
+                # Apply the fallback to the family; other TPC-BF1241 variants
+                # have not yet been verified to behave the same way.
+                or m.startswith("TPC-BF1241"))
 
     def supports_nvr_active_deterrence(self) -> bool:
         """Return whether NVR active-deterrence entities were explicitly enabled."""
@@ -2086,7 +2226,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """
         m = self.model.upper()
         return (
-            "-AS-PV" in m
+            self.uses_rpc2_deterrence(1)
+            or "-AS-PV" in m
             or m == "AD410"
             or m == "DB61I"
             or m.startswith("IP8M-2796E")
@@ -2153,17 +2294,46 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 for profile in range(9)
                 for index in range(MAX_LIGHTING_V2_LIGHTS)
             )
-        return not (self.is_amcrest_doorbell() or self.is_flood_light()) and "table.Lighting_V2[{0}][0][0].Mode".format(self._channel) in self.data
+        if self.is_amcrest_doorbell() or self.is_flood_light():
+            return False
+        if "table.Lighting_V2[{0}][0][0].Mode".format(
+                self._channel) not in self.data:
+            return False
+        return self._declares_a_white_light()
+
+    def _declares_a_white_light(self) -> bool:
+        """Whether this channel reports a white emitter, if it says at all.
+
+        Having a Lighting_V2 row only says the camera has *a* light. #540 is
+        an IPC-HDW2831T-AS-S2, which has no white light at all: its single
+        emitter is infrared, so the Illuminator entity drove the night vision
+        LED and the camera's own UI calls that control Illuminator too, which
+        is how it went unnoticed.
+
+        The same check already existed for one model, behind a name prefix.
+        This is it applied to whatever the device says, which is the fourth
+        time a capability here turns out to be gated on a model string when
+        the device was willing to answer the question (#570, #676, #690).
+
+        A device that names no LightType keeps exactly the behaviour it has
+        always had. Older firmware does not report them, and withdrawing an
+        entity on silence would take the light away from everyone who has one
+        working. Only a device that lists its emitters and names no white one
+        loses it, which is the only case where we know it was wrong.
+        """
+        key = "table.Lighting_V2[{0}][0][{1}].LightType"
+        declared = [
+            self.data.get(key.format(self._channel, index))
+            for index in range(MAX_LIGHTING_V2_LIGHTS)
+        ]
+        named = [light for light in declared if light is not None]
+        if not named:
+            return True
+        return WHITE_LIGHT in named
 
     def uses_lighting_scheme_illuminator(self) -> bool:
         """Whether this device needs the two-table white-light contract."""
         return getattr(self, "_supports_lighting_scheme_illuminator", False)
-    
-    def supports_ptz_position(self) -> bool:
-        """
-        Returns true if this camera supports PTZ preset position
-        """
-        return  not (self.is_amcrest_doorbell() or self.is_flood_light()) and "table.Lighting_V2[{0}][0][0].Mode".format(self._channel) in self.data   
 
     def is_motion_detection_enabled(self) -> bool:
         """ Returns true if motion detection is enabled for the camera """
@@ -2492,7 +2662,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """
         try:
             conf = await self.client.async_get_config_lighting(self._channel, self._profile_mode)
-        except PROBE_FAILED:
+        except PROBE_FAILED as probe_error:
+            self._note_probe_refusal("lighting", probe_error)
             return False
         return len(conf) > 0
 

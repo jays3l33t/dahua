@@ -16,6 +16,13 @@
                     "channel": "Channel (a single camera is 0. On an NVR this is the 0-based index, which is one less than the number the recorder shows: its channel 4 is 3 here)"
                 }
             },
+            "channels": {
+                "title": "Add other channels",
+                "description": "This recorder has other channels with a camera on them. Tick any you want added now. Channels that are empty, switched off, or reached over ONVIF are not listed, because this integration cannot drive them.",
+                "data": {
+                    "extra_channels": "Channels to add"
+                }
+            },
             "name": {
                 "title": "Configure Device Name",
                 "data": {
@@ -41,6 +48,9 @@
                     "use_https": "Use HTTPS (otherwise HTTPS is used only on port 443)"
                 }
             }
+        },
+        "progress": {
+            "discover": "Looking for other channels on this device. This can take up to {seconds} seconds."
         },
         "error": {
             "auth": "The camera rejected that username and password.",
@@ -74,6 +84,7 @@
                     "events": "Events to subscribe to",
                     "scan_interval": "Seconds between device polls (events are not affected)",
                     "nvr_active_deterrence": "Enable NVR active deterrence controls",
+                    "disable_backchannel": "Don't open the two-way audio channel when streaming (fixes a doorbell stuck in a call, or talkback in the Dahua/Amcrest app; disables talking from Home Assistant)",
                     "authorized_plates": "Authorized license plates (comma-separated, e.g. ABC1234, XYZ5678)",
                     "authorized_hold_time": "Authorized vehicle hold time (seconds to remain ON)"
                 }
